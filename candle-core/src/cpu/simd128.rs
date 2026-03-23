@@ -62,3 +62,62 @@ impl Cpu<ARR> for CurrentCpu {
             + f32x4_extract_lane::<3>(x[0]);
     }
 }
+
+/// Compute 4 dot products simultaneously: dot(a, b0), dot(a, b1), dot(a, b2), dot(a, b3).
+/// Shares LHS loads across all 4 RHS columns for better throughput.
+/// All pointers must point to contiguous f32 arrays of length >= k.
+#[inline(always)]
+pub(crate) unsafe fn vec_dot_f32_4col(
+    a: *const f32,
+    b0: *const f32,
+    b1: *const f32,
+    b2: *const f32,
+    b3: *const f32,
+    k: usize,
+) -> [f32; 4] {
+    let np = k & !(STEP - 1);
+
+    // 4 independent accumulators per column to break dependency chains
+    let mut sum0 = [f32x4_splat(0.0); ARR];
+    let mut sum1 = [f32x4_splat(0.0); ARR];
+    let mut sum2 = [f32x4_splat(0.0); ARR];
+    let mut sum3 = [f32x4_splat(0.0); ARR];
+
+    for i in (0..np).step_by(STEP) {
+        for j in 0..ARR {
+            let av = v128_load(a.add(i + j * EPR) as *const v128);
+            sum0[j] = f32x4_add(sum0[j], f32x4_mul(av, v128_load(b0.add(i + j * EPR) as *const v128)));
+            sum1[j] = f32x4_add(sum1[j], f32x4_mul(av, v128_load(b1.add(i + j * EPR) as *const v128)));
+            sum2[j] = f32x4_add(sum2[j], f32x4_mul(av, v128_load(b2.add(i + j * EPR) as *const v128)));
+            sum3[j] = f32x4_add(sum3[j], f32x4_mul(av, v128_load(b3.add(i + j * EPR) as *const v128)));
+        }
+    }
+
+    // Tree-reduce each column's accumulators
+    #[inline(always)]
+    unsafe fn reduce(mut s: [v128; ARR]) -> f32 {
+        for i in 0..ARR / 2 {
+            s[2 * i] = f32x4_add(s[2 * i], s[2 * i + 1]);
+        }
+        for i in 0..ARR / 4 {
+            s[4 * i] = f32x4_add(s[4 * i], s[4 * i + 2]);
+        }
+        f32x4_extract_lane::<0>(s[0])
+            + f32x4_extract_lane::<1>(s[0])
+            + f32x4_extract_lane::<2>(s[0])
+            + f32x4_extract_lane::<3>(s[0])
+    }
+
+    let mut result = [reduce(sum0), reduce(sum1), reduce(sum2), reduce(sum3)];
+
+    // Scalar remainder for k % 16
+    for i in np..k {
+        let av = *a.add(i);
+        result[0] += av * *b0.add(i);
+        result[1] += av * *b1.add(i);
+        result[2] += av * *b2.add(i);
+        result[3] += av * *b3.add(i);
+    }
+
+    result
+}

@@ -1406,6 +1406,64 @@ impl Map2 for MatMul {
         } else {
             (b, m, n, k)
         };
+
+        // WASM SIMD128 fast path for f32 NT layout (LHS row-major, RHS column-major).
+        // This is the layout produced by im2col conv1d: lhs_cs==1 means K is contiguous
+        // in LHS rows, rhs_rs==1 means K is contiguous in RHS columns.
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if T::DTYPE == DType::F32 && lhs_cs == 1 && rhs_rs == 1 {
+            const N_TILE: usize = 32;
+            let dst_f32: &mut [f32] = unsafe {
+                core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut f32, dst.len())
+            };
+            for step in 0..b {
+                let lhs_p = lhs[step * a_skip..].as_ptr() as *const f32;
+                let rhs_p = rhs[step * b_skip..].as_ptr() as *const f32;
+                let dst_s = &mut dst_f32[step * c_skip..];
+
+                for col_tile in (0..n).step_by(N_TILE) {
+                    let tile_end = (col_tile + N_TILE).min(n);
+                    for row in 0..m {
+                        let a_ptr = unsafe { lhs_p.add(row * lhs_rs) };
+                        let dst_off = row * n;
+
+                        // Process 4 columns at a time
+                        let mut j = col_tile;
+                        while j + 4 <= tile_end {
+                            let results = unsafe {
+                                crate::cpu::vec_dot_f32_4col(
+                                    a_ptr,
+                                    rhs_p.add(j * rhs_cs),
+                                    rhs_p.add((j + 1) * rhs_cs),
+                                    rhs_p.add((j + 2) * rhs_cs),
+                                    rhs_p.add((j + 3) * rhs_cs),
+                                    k,
+                                )
+                            };
+                            dst_s[dst_off + j..dst_off + j + 4]
+                                .copy_from_slice(&results);
+                            j += 4;
+                        }
+                        // Remainder columns
+                        while j < tile_end {
+                            let mut val = 0f32;
+                            unsafe {
+                                crate::cpu::vec_dot_f32(
+                                    a_ptr,
+                                    rhs_p.add(j * rhs_cs),
+                                    &mut val,
+                                    k,
+                                );
+                            }
+                            dst_s[dst_off + j] = val;
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            return Ok(dst);
+        }
+
         for step in 0..b {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];

@@ -123,6 +123,19 @@ pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+pub(crate) unsafe fn vec_dot_f32_4col(
+    a: *const f32,
+    b0: *const f32,
+    b1: *const f32,
+    b2: *const f32,
+    b3: *const f32,
+    k: usize,
+) -> [f32; 4] {
+    simd128::vec_dot_f32_4col(a, b0, b1, b2, b3, k)
+}
+
 #[cfg(any(
     target_feature = "neon",
     target_feature = "avx2",
