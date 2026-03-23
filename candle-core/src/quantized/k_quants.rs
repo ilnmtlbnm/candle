@@ -52,6 +52,24 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
 
     /// Generic implementation of the dot product without simd optimizations.
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
+
+    /// Compute 4 dot products simultaneously, sharing LHS loads.
+    /// Default impl calls vec_dot 4 times; optimized types override.
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> [f32; 4] {
+        [
+            Self::vec_dot(n, xs0, ys),
+            Self::vec_dot(n, xs1, ys),
+            Self::vec_dot(n, xs2, ys),
+            Self::vec_dot(n, xs3, ys),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -677,6 +695,26 @@ impl GgmlType for BlockQ8_0 {
             sumf += sum_i as f32 * f16::to_f32(xs.d) * f16::to_f32(ys.d)
         }
         sumf
+    }
+
+    #[allow(unreachable_code)]
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> [f32; 4] {
+        #[cfg(target_feature = "simd128")]
+        return super::simd128::vec_dot_q8_0_q8_0_4col(n, xs0, xs1, xs2, xs3, ys);
+
+        [
+            Self::vec_dot(n, xs0, ys),
+            Self::vec_dot(n, xs1, ys),
+            Self::vec_dot(n, xs2, ys),
+            Self::vec_dot(n, xs3, ys),
+        ]
     }
 }
 
@@ -2264,6 +2302,94 @@ impl GgmlType for BlockQ8K {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn matmul_inner<T: GgmlType>(
+    m: usize,
+    k: usize,
+    n: usize,
+    kb: usize,
+    lhs_b: &[T::VecDotType],
+    rhs_t: &[T],
+    dst: &mut [f32],
+) {
+    const N_TILE: usize = 32;
+
+    for col_tile in (0..n).step_by(N_TILE) {
+        let tile_end = (col_tile + N_TILE).min(n);
+        for row_idx in 0..m {
+            let lhs_row = &lhs_b[row_idx * kb..(row_idx + 1) * kb];
+            let dst_off = row_idx * n;
+
+            // Process 4 columns at a time
+            let mut j = col_tile;
+            while j + 4 <= tile_end {
+                let results = T::vec_dot_4(
+                    k,
+                    &rhs_t[j * kb..(j + 1) * kb],
+                    &rhs_t[(j + 1) * kb..(j + 2) * kb],
+                    &rhs_t[(j + 2) * kb..(j + 3) * kb],
+                    &rhs_t[(j + 3) * kb..(j + 4) * kb],
+                    lhs_row,
+                );
+                dst[dst_off + j..dst_off + j + 4].copy_from_slice(&results);
+                j += 4;
+            }
+            // Scalar remainder
+            while j < tile_end {
+                dst[dst_off + j] = T::vec_dot(k, &rhs_t[j * kb..(j + 1) * kb], lhs_row);
+                j += 1;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn matmul_inner<T: GgmlType>(
+    m: usize,
+    k: usize,
+    n: usize,
+    kb: usize,
+    lhs_b: &[T::VecDotType],
+    rhs_t: &[T],
+    dst: &mut [f32],
+) {
+    let n_aligned = n & !3;
+
+    for row_idx in 0..m {
+        let lhs_row = &lhs_b[row_idx * kb..(row_idx + 1) * kb];
+        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
+
+        if n_aligned > 0 {
+            dst_row[..n_aligned]
+                .par_chunks_mut(4)
+                .enumerate()
+                .with_min_len(32)
+                .for_each(|(ci, chunk)| {
+                    let col = ci * 4;
+                    let r = T::vec_dot_4(
+                        k,
+                        &rhs_t[col * kb..(col + 1) * kb],
+                        &rhs_t[(col + 1) * kb..(col + 2) * kb],
+                        &rhs_t[(col + 2) * kb..(col + 3) * kb],
+                        &rhs_t[(col + 3) * kb..(col + 4) * kb],
+                        lhs_row,
+                    );
+                    chunk.copy_from_slice(&r);
+                });
+        }
+        // Remainder columns
+        for j in n_aligned..n {
+            dst_row[j] = T::vec_dot(k, &rhs_t[j * kb..(j + 1) * kb], lhs_row);
+        }
+    }
+}
+
+use std::cell::RefCell;
+
+thread_local! {
+    static LHS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 // https://github.com/ggml-org/llama.cpp/blob/aa3ee0eb0b80efca126cedf9bcb4fb5864b46ce3/ggml/src/ggml-cpu/ggml-cpu.c#L1205
 pub fn matmul<T: GgmlType>(
     (m, k, n): (usize, usize, usize),
@@ -2283,34 +2409,39 @@ pub fn matmul<T: GgmlType>(
         lhs.len()
     );
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
+    let count = m * k_in_blocks;
 
-    // TODO: Pre-allocate this.
-    let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_blocks];
-    // f32, f16, and bf16 support direct copy
-    if T::DIRECT_COPY {
-        T::VecDotType::direct_copy(lhs, &mut lhs_b);
-    } else {
-        for row_idx in 0..m {
-            let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-            let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
-            T::VecDotType::from_float(lhs, lhs_b_mut)
+    LHS_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let elem_size = std::mem::size_of::<T::VecDotType>();
+        let elem_align = std::mem::align_of::<T::VecDotType>();
+        let needed = count * elem_size + elem_align;
+        buf.resize(needed, 0);
+
+        let align_offset = buf.as_mut_ptr().align_offset(elem_align);
+        // SAFETY: buf is large enough for `count` elements plus alignment padding.
+        // VecDotType is a plain-data quantization block where any initialized byte
+        // pattern is valid, and `from_float`/`direct_copy` fully writes each element.
+        let lhs_b = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().add(align_offset) as *mut T::VecDotType,
+                count,
+            )
+        };
+
+        // f32, f16, and bf16 support direct copy
+        if T::DIRECT_COPY {
+            T::VecDotType::direct_copy(lhs, lhs_b);
+        } else {
+            for row_idx in 0..m {
+                let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+                let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
+                T::VecDotType::from_float(lhs, lhs_b_mut)
+            }
         }
-    }
 
-    for row_idx in 0..m {
-        let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
-
-        dst_row
-            .into_par_iter()
-            .enumerate()
-            .with_min_len(128)
-            .with_max_len(512)
-            .for_each(|(col_idx, dst)| {
-                let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
-                *dst = T::vec_dot(k, rhs_col, lhs_row);
-            });
-    }
+        matmul_inner::<T>(m, k, n, k_in_blocks, lhs_b, rhs_t, dst);
+    });
     Ok(())
 }
 

@@ -91,6 +91,112 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
 }
 
 #[inline(always)]
+pub(crate) fn vec_dot_q8_0_q8_0_4col(
+    n: usize,
+    xs0: &[BlockQ8_0],
+    xs1: &[BlockQ8_0],
+    xs2: &[BlockQ8_0],
+    xs3: &[BlockQ8_0],
+    ys: &[BlockQ8_0],
+) -> [f32; 4] {
+    let nb = n / QK8_0;
+    debug_assert!(
+        n.is_multiple_of(QK8_0),
+        "vec_dot_q8_0_q8_0_4col: {n} is not divisible by {QK8_0}"
+    );
+    unsafe {
+        let mut acc0 = f32x4_splat(0.0f32);
+        let mut acc1 = f32x4_splat(0.0f32);
+        let mut acc2 = f32x4_splat(0.0f32);
+        let mut acc3 = f32x4_splat(0.0f32);
+
+        for i in 0..nb {
+            // Load LHS block once (shared across 4 columns)
+            let y1 = i16x8_load_extend_i8x8(ys[i].qs.as_ptr());
+            let y2 = i16x8_load_extend_i8x8(ys[i].qs.as_ptr().add(8));
+            let y3 = i16x8_load_extend_i8x8(ys[i].qs.as_ptr().add(16));
+            let y4 = i16x8_load_extend_i8x8(ys[i].qs.as_ptr().add(24));
+            let yd = f16::to_f32(ys[i].d);
+
+            // Column 0
+            {
+                let x1 = i16x8_load_extend_i8x8(xs0[i].qs.as_ptr());
+                let x2 = i16x8_load_extend_i8x8(xs0[i].qs.as_ptr().add(8));
+                let x3 = i16x8_load_extend_i8x8(xs0[i].qs.as_ptr().add(16));
+                let x4 = i16x8_load_extend_i8x8(xs0[i].qs.as_ptr().add(24));
+                let sum_xy = i32x4_add(
+                    i32x4_add(i32x4_dot_i16x8(y1, x1), i32x4_dot_i16x8(y2, x2)),
+                    i32x4_add(i32x4_dot_i16x8(y3, x3), i32x4_dot_i16x8(y4, x4)),
+                );
+                let d = f32x4_splat(yd * f16::to_f32(xs0[i].d));
+                acc0 = f32x4_add(acc0, f32x4_mul(f32x4_convert_i32x4(sum_xy), d));
+            }
+
+            // Column 1
+            {
+                let x1 = i16x8_load_extend_i8x8(xs1[i].qs.as_ptr());
+                let x2 = i16x8_load_extend_i8x8(xs1[i].qs.as_ptr().add(8));
+                let x3 = i16x8_load_extend_i8x8(xs1[i].qs.as_ptr().add(16));
+                let x4 = i16x8_load_extend_i8x8(xs1[i].qs.as_ptr().add(24));
+                let sum_xy = i32x4_add(
+                    i32x4_add(i32x4_dot_i16x8(y1, x1), i32x4_dot_i16x8(y2, x2)),
+                    i32x4_add(i32x4_dot_i16x8(y3, x3), i32x4_dot_i16x8(y4, x4)),
+                );
+                let d = f32x4_splat(yd * f16::to_f32(xs1[i].d));
+                acc1 = f32x4_add(acc1, f32x4_mul(f32x4_convert_i32x4(sum_xy), d));
+            }
+
+            // Column 2
+            {
+                let x1 = i16x8_load_extend_i8x8(xs2[i].qs.as_ptr());
+                let x2 = i16x8_load_extend_i8x8(xs2[i].qs.as_ptr().add(8));
+                let x3 = i16x8_load_extend_i8x8(xs2[i].qs.as_ptr().add(16));
+                let x4 = i16x8_load_extend_i8x8(xs2[i].qs.as_ptr().add(24));
+                let sum_xy = i32x4_add(
+                    i32x4_add(i32x4_dot_i16x8(y1, x1), i32x4_dot_i16x8(y2, x2)),
+                    i32x4_add(i32x4_dot_i16x8(y3, x3), i32x4_dot_i16x8(y4, x4)),
+                );
+                let d = f32x4_splat(yd * f16::to_f32(xs2[i].d));
+                acc2 = f32x4_add(acc2, f32x4_mul(f32x4_convert_i32x4(sum_xy), d));
+            }
+
+            // Column 3
+            {
+                let x1 = i16x8_load_extend_i8x8(xs3[i].qs.as_ptr());
+                let x2 = i16x8_load_extend_i8x8(xs3[i].qs.as_ptr().add(8));
+                let x3 = i16x8_load_extend_i8x8(xs3[i].qs.as_ptr().add(16));
+                let x4 = i16x8_load_extend_i8x8(xs3[i].qs.as_ptr().add(24));
+                let sum_xy = i32x4_add(
+                    i32x4_add(i32x4_dot_i16x8(y1, x1), i32x4_dot_i16x8(y2, x2)),
+                    i32x4_add(i32x4_dot_i16x8(y3, x3), i32x4_dot_i16x8(y4, x4)),
+                );
+                let d = f32x4_splat(yd * f16::to_f32(xs3[i].d));
+                acc3 = f32x4_add(acc3, f32x4_mul(f32x4_convert_i32x4(sum_xy), d));
+            }
+        }
+
+        [
+            f32x4_extract_lane::<0>(acc0)
+                + f32x4_extract_lane::<1>(acc0)
+                + f32x4_extract_lane::<2>(acc0)
+                + f32x4_extract_lane::<3>(acc0),
+            f32x4_extract_lane::<0>(acc1)
+                + f32x4_extract_lane::<1>(acc1)
+                + f32x4_extract_lane::<2>(acc1)
+                + f32x4_extract_lane::<3>(acc1),
+            f32x4_extract_lane::<0>(acc2)
+                + f32x4_extract_lane::<1>(acc2)
+                + f32x4_extract_lane::<2>(acc2)
+                + f32x4_extract_lane::<3>(acc2),
+            f32x4_extract_lane::<0>(acc3)
+                + f32x4_extract_lane::<1>(acc3)
+                + f32x4_extract_lane::<2>(acc3)
+                + f32x4_extract_lane::<3>(acc3),
+        ]
+    }
+}
+
+#[inline(always)]
 pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
